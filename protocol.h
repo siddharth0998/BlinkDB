@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <string_view>
 
 using namespace std;
 
@@ -49,7 +50,7 @@ int read_number_line(const string &buf, size_t &pos, char prefix, long long &out
     return PARSE_OK;
 }
 
-int parse_resp_request(const string &buf, vector<string> &cmd, size_t &consumed, size_t &start)
+int parse_resp_request(const string &buf, vector<string_view> &cmd, size_t &consumed, size_t &start)
 {
     size_t pos = start;
     long long count = 0;
@@ -75,7 +76,7 @@ int parse_resp_request(const string &buf, vector<string> &cmd, size_t &consumed,
             return PARSE_INCOMPLETE;
         if (buf[pos + len] != '\r' || buf[pos + len + 1] != '\n')
             return PARSE_ERROR;
-        cmd.push_back(buf.substr(pos, len));
+        cmd.push_back(string_view(buf.data() + pos, len));
         pos += len + 2;
     }
     consumed = pos - start;
