@@ -75,16 +75,16 @@ string *db_find(const string &key)
     return nullptr;
 }
 
-void db_set(const string &key, const string &value)
+void db_set(const string &key, string_view value)
 {
     string *old_value = db_find(key);
     if (old_value != nullptr)
     {
-        *old_value = value;
+        old_value->assign(value.data(), value.size());
         return;
     }
     grow_if_needed();
-    g_newer[key] = value;
+    g_newer[key].assign(value.data(), value.size());
 }
 
 int db_del(const string &key)
@@ -176,9 +176,9 @@ string to_lower(string s)
     return s;
 }
 
-void do_request(const vector<string> &cmd, string &out)
+void do_request(const vector<string_view> &cmd, string &out)
 {
-    string name = to_lower(cmd[0]);
+    string name = to_lower(string(cmd[0]));
     move_some_keys();
     if (name == "ping")
     {
@@ -191,7 +191,7 @@ void do_request(const vector<string> &cmd, string &out)
             reply_error(out, "ERR wrong number of arguments for 'get' command");
             return;
         }
-        string *value = db_find(cmd[1]);
+        string *value = db_find(string(cmd[1]));
         if (value == nullptr)
             reply_null(out);
         else
@@ -204,7 +204,7 @@ void do_request(const vector<string> &cmd, string &out)
             reply_error(out, "ERR wrong number of arguments for 'set' command");
             return;
         }
-        db_set(cmd[1], cmd[2]);
+        db_set(string(cmd[1]), cmd[2]);
         reply_simple(out, "OK");
     }
     else if (name == "del")
@@ -217,13 +217,13 @@ void do_request(const vector<string> &cmd, string &out)
         long long deleted = 0;
         for (size_t i = 1; i < cmd.size(); i++)
         {
-            deleted += db_del(cmd[i]);
+            deleted += db_del(string(cmd[i]));
         }
         reply_integer(out, deleted);
     }
     else
     {
-        reply_error(out, "ERR unknown command '" + cmd[0] + "'");
+        reply_error(out, "ERR unknown command '" + string(cmd[0]) + "'");
     }
 }
 
@@ -236,7 +236,7 @@ string short_text(const string &s)
 
 bool try_one_message(Conn *conn)
 {
-    vector<string> cmd;
+    vector<string_view> cmd;
     size_t consumed = 0;
     int r = parse_resp_request(conn->incoming, cmd, consumed, conn->read_pos);
 
