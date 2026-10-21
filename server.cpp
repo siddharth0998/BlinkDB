@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -33,6 +35,8 @@ struct Conn
     bool want_read = false;
     bool want_write = false;
     bool want_close = false;
+    bool kq_read = false;
+    bool kq_write = false;
     string incoming;
     string outgoing;
 };
@@ -256,6 +260,44 @@ bool try_one_message(Conn *conn)
     return true;
 }
 
+void kqueue_add(int kq, Conn *conn)
+{
+    struct kevent changes[2];
+    EV_SET(&changes[0], conn->fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    EV_SET(&changes[1], conn->fd, EVFILT_WRITE, EV_ADD | EV_DISABLE, 0, 0, NULL);
+    if (kevent(kq, changes, 2, NULL, 0, NULL) < 0)
+    {
+        perror("kevent add failed");
+        conn->want_close = true;
+        return;
+    }
+    conn->kq_read = true;
+    conn->kq_write = false;
+}
+
+void kqueue_update(int kq, Conn *conn)
+{
+    struct kevent changes[2];
+    int count = 0;
+    if (conn->want_read != conn->kq_read)
+    {
+        EV_SET(&changes[count], conn->fd, EVFILT_READ, conn->want_read ? EV_ENABLE : EV_DISABLE, 0, 0, NULL);
+        count++;
+        conn->kq_read = conn->want_read;
+    }
+    if (conn->want_write != conn->kq_write)
+    {
+        EV_SET(&changes[count], conn->fd, EVFILT_WRITE, conn->want_write ? EV_ENABLE : EV_DISABLE, 0, 0, NULL);
+        count++;
+        conn->kq_write = conn->want_write;
+    }
+    if (count > 0 && kevent(kq, changes, count, NULL, 0, NULL) < 0)
+    {
+        perror("kevent update failed");
+        conn->want_close = true;
+    }
+}
+
 void handle_write(Conn *conn)
 {
     ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
@@ -360,69 +402,75 @@ int main(int argc, char *argv[])
 
     cout << "key-value server is running on port " << ntohs(addr.sin_port) << "..." << endl;
 
+    // 4. create the kqueue and tell it to watch the listening socket
+    int kq = kqueue();
+    if (kq < 0)
+    {
+        perror("kqueue failed");
+        return 1;
+    }
+    struct kevent listen_event;
+    EV_SET(&listen_event, server_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    if (kevent(kq, &listen_event, 1, NULL, 0, NULL) < 0)
+    {
+        perror("kevent failed");
+        return 1;
+    }
+
     vector<Conn *> fd2conn;
-    vector<pollfd> poll_args;
+    const int MAX_EVENTS = 1024;
+    struct kevent events[MAX_EVENTS];
 
     while (true)
     {
-        poll_args.clear();
-        poll_args.push_back({server_fd, POLLIN, 0});
+        struct timespec one_second = {1, 0};
+        struct timespec *timeout = show_stats ? &one_second : NULL;
 
-        for (Conn *conn : fd2conn)
-        {
-            if (conn == nullptr)
-                continue;
-            pollfd pfd = {conn->fd, POLLERR, 0};
-            if (conn->want_read)
-                pfd.events |= POLLIN;
-            if (conn->want_write)
-                pfd.events |= POLLOUT;
-            poll_args.push_back(pfd);
-        }
-
-        int timeout_ms = show_stats ? 1000 : -1;
-        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
-        if (rv < 0 && errno == EINTR)
+        int n = kevent(kq, NULL, 0, events, MAX_EVENTS, timeout);
+        if (n < 0 && errno == EINTR)
             continue;
-        if (rv < 0)
+        if (n < 0)
         {
-            perror("poll failed");
+            perror("kevent wait failed");
             return 1;
         }
 
-        if (poll_args[0].revents)
+        for (int i = 0; i < n; i++)
         {
-            while (Conn *conn = handle_accept(server_fd))
+            int fd = (int)events[i].ident;
+            if (fd == server_fd)
             {
-                if (fd2conn.size() <= (size_t)conn->fd)
-                    fd2conn.resize(conn->fd + 1, nullptr);
-                fd2conn[conn->fd] = conn;
-            }
-        }
-
-        for (size_t i = 1; i < poll_args.size(); i++)
-        {
-            short ready = poll_args[i].revents;
-            if (ready == 0)
-            {
+                while (Conn *conn = handle_accept(server_fd))
+                {
+                    if (fd2conn.size() <= (size_t)conn->fd)
+                    {
+                        fd2conn.resize(conn->fd + 1, nullptr);
+                    }
+                    fd2conn[conn->fd] = conn;
+                    kqueue_add(kq, conn);
+                }
                 continue;
             }
 
-            Conn *conn = fd2conn[poll_args[i].fd];
+            if ((size_t)fd >= fd2conn.size() || fd2conn[fd] == nullptr)
+                continue;
+            Conn *conn = fd2conn[fd];
 
-            if (ready & POLLIN)
+            if (events[i].flags & EV_ERROR)
+                conn->want_close = true;
+            else if (events[i].filter == EVFILT_READ)
                 handle_read(conn);
-            if (ready & POLLOUT)
+            else if (events[i].filter == EVFILT_WRITE)
                 handle_write(conn);
 
-            bool hung_up = (ready & POLLHUP) && !(ready & POLLIN);
-
-            if ((ready & POLLERR) || hung_up || conn->want_close)
+            if (conn->want_close)
             {
                 close(conn->fd);
                 fd2conn[conn->fd] = nullptr;
                 delete conn;
             }
+            else
+                kqueue_update(kq, conn);
         }
         if (show_stats)
         {
