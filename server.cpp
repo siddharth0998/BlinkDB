@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <sys/resource.h>
+#include <cstring>
 
 using namespace std;
 
@@ -27,17 +28,22 @@ unordered_map<string, string> g_older;
 const size_t MOVE_PER_REQUEST = 128;
 long long g_grows = 0;
 long long g_requests = 0;
+const size_t READ_CHUNK = 64 * 1024;
 
 struct Conn
 {
     int fd = -1;
-    size_t read_pos = 0;
     bool want_read = false;
     bool want_write = false;
     bool want_close = false;
     bool kq_read = false;
     bool kq_write = false;
+
     string incoming;
+    size_t in_len = 0;
+    size_t read_pos = 0;
+
+    vector<string_view> cmd;
     string outgoing;
 };
 
@@ -240,9 +246,9 @@ string short_text(const string &s)
 
 bool try_one_message(Conn *conn)
 {
-    vector<string_view> cmd;
     size_t consumed = 0;
-    int r = parse_resp_request(conn->incoming, cmd, consumed, conn->read_pos);
+    string_view data(conn->incoming.data(), conn->in_len);
+    int r = parse_resp_request(data, conn->cmd, consumed, conn->read_pos);
 
     if (r == PARSE_INCOMPLETE)
     {
@@ -254,7 +260,7 @@ bool try_one_message(Conn *conn)
         conn->want_close = true;
         return false;
     }
-    do_request(cmd, conn->outgoing);
+    do_request(conn->cmd, conn->outgoing);
     g_requests++;
     conn->read_pos += consumed;
     return true;
@@ -323,8 +329,11 @@ void handle_write(Conn *conn)
 
 void handle_read(Conn *conn)
 {
-    char buf[64 * 1024];
-    ssize_t rv = read(conn->fd, buf, sizeof(buf));
+
+    if (conn->incoming.size() < conn->in_len + READ_CHUNK)
+        conn->incoming.resize(conn->in_len + READ_CHUNK);
+
+    ssize_t rv = read(conn->fd, &conn->incoming[conn->in_len], READ_CHUNK);
 
     if (rv < 0 && errno == EAGAIN)
     {
@@ -344,13 +353,15 @@ void handle_read(Conn *conn)
         return;
     }
 
-    conn->incoming.append(buf, rv);
+    conn->in_len += rv;
 
     while (try_one_message(conn))
         ;
     if (conn->read_pos > 0)
     {
-        conn->incoming.erase(0, conn->read_pos);
+        size_t left = conn->in_len - conn->read_pos;
+        memmove(&conn->incoming[0], &conn->incoming[conn->read_pos], left);
+        conn->in_len = left;
         conn->read_pos = 0;
     }
 

@@ -14,7 +14,7 @@ const int PARSE_OK = 1;
 const int PARSE_INCOMPLETE = 0;
 const int PARSE_ERROR = -1;
 
-int read_number_line(const string &buf, size_t &pos, char prefix, long long &out)
+int read_number_line(string_view buf, size_t &pos, char prefix, long long &out)
 {
     if (pos >= buf.size())
     {
@@ -24,46 +24,39 @@ int read_number_line(const string &buf, size_t &pos, char prefix, long long &out
     {
         return PARSE_ERROR;
     }
-    size_t end = buf.find("\r\n", pos);
-    if (end == string::npos)
+    long long n = 0;
+    size_t digits = 0;
+    size_t i = pos + 1;
+
+    while (i < buf.size() && buf[i] != '\r')
     {
-        if (buf.size() - pos > 32)
-        {
+        char c = buf[i];
+        if (c < '0' || c > '9' || digits == 18)
             return PARSE_ERROR;
-        }
+        n = n * 10 + (c - '0');
+        digits++;
+        i++;
+    }
+    if (i + 1 >= buf.size())
         return PARSE_INCOMPLETE;
-    }
-    string digits = buf.substr(pos + 1, end - pos - 1);
-    if (digits.empty() || digits.size() > 18)
-    {
+    if (digits == 0 || buf[i + 1] != '\n')
         return PARSE_ERROR;
-    }
-    for (char c : digits)
-    {
-        if (c < '0' || c > '9')
-        {
-            return PARSE_ERROR;
-        }
-    }
-    out = stoll(digits);
-    pos = end + 2;
+
+    out = n;
+    pos = i + 2;
     return PARSE_OK;
 }
 
-int parse_resp_request(const string &buf, vector<string_view> &cmd, size_t &consumed, size_t &start)
+int parse_resp_request(string_view buf, vector<string_view> &cmd, size_t &consumed, size_t &start)
 {
+    cmd.clear();
     size_t pos = start;
     long long count = 0;
     int r = read_number_line(buf, pos, '*', count);
     if (r != PARSE_OK)
-    {
         return r;
-    }
     if (count < 1 || count > (long long)MAX_ARGS)
-    {
         return PARSE_ERROR;
-    }
-
     for (long long i = 0; i < count; i++)
     {
         long long len = 0;
@@ -76,21 +69,25 @@ int parse_resp_request(const string &buf, vector<string_view> &cmd, size_t &cons
             return PARSE_INCOMPLETE;
         if (buf[pos + len] != '\r' || buf[pos + len + 1] != '\n')
             return PARSE_ERROR;
-        cmd.push_back(string_view(buf.data() + pos, len));
+        cmd.push_back(buf.substr(pos, len));
         pos += len + 2;
     }
     consumed = pos - start;
     return PARSE_OK;
 }
 
-void reply_simple(string &out, const string &s)
+void reply_simple(string &out, string_view s)
 {
-    out += "+" + s + "\r\n";
+    out += '+';
+    out.append(s.data(), s.size());
+    out += "\r\n";
 }
 
-void reply_error(string &out, const string &msg)
+void reply_error(string &out, string_view msg)
 {
-    out += "-" + msg + "\r\n";
+    out += "-";
+    out.append(msg.data(), msg.size());
+    out += "\r\n";
 }
 
 void reply_integer(string &out, long long n)
@@ -98,9 +95,13 @@ void reply_integer(string &out, long long n)
     out += ":" + to_string(n) + "\r\n";
 }
 
-void reply_bulk(string &out, const string &s)
+void reply_bulk(string &out, string_view s)
 {
-    out += "$" + to_string(s.size()) + "\r\n" + s + "\r\n";
+    out += "$";
+    out += to_string(s.size());
+    out += "\r\n";
+    out.append(s.data(), s.size());
+    out += "\r\n";
 }
 
 void reply_null(string &out)
